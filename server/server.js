@@ -1,9 +1,17 @@
 // server/server.js
 const path = require("path");
+
+// ✅ โหลด env ตอนรันในเครื่อง (VSCode/local)
+if (!process.env.VERCEL) {
+  // ต้องติดตั้ง: npm i dotenv
+  require("dotenv").config({
+    path: path.join(__dirname, "..", ".env.local"),
+  });
+}
+
 const express = require("express");
 const cookieSignature = require("cookie-signature");
 const bcrypt = require("bcryptjs");
-require("dotenv").config();
 
 const { sql } = require("@vercel/postgres");
 const { put } = require("@vercel/blob");
@@ -12,14 +20,15 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 const IS_VERCEL = !!process.env.VERCEL;
-
 const APP_SECRET = process.env.APP_SECRET || "dev_secret_change_me";
+
+// ✅ ตั้งค่า super admin ผ่าน env ได้ (แนะนำ)
 const SUPER_USERNAME = process.env.SUPER_USERNAME || "Chainimitr";
 const SUPER_PASSWORD = process.env.SUPER_PASSWORD || "1234";
 
 const WEB_DIR = path.join(__dirname, "..", "web");
 
-// -------------------- middleware --------------------
+// ---- middleware ----
 app.use(express.json({ limit: "60mb" }));
 app.use(express.urlencoded({ extended: true, limit: "60mb" }));
 
@@ -33,22 +42,22 @@ app.use((req, res, next) => {
   next();
 });
 
+// กัน API cache
 app.use((req, res, next) => {
   if (req.path.startsWith("/api/")) res.setHeader("Cache-Control", "no-store");
   next();
 });
 
-// เสิร์ฟเว็บ
+// เสิร์ฟเว็บ (static)
 app.use(express.static(WEB_DIR));
 
-// -------------------- cookie/session utils --------------------
+// ---- cookie utils ----
 function parseCookies(req) {
   const header = req.headers.cookie || "";
   const parts = header
     .split(";")
     .map((x) => x.trim())
     .filter(Boolean);
-
   const out = {};
   for (const p of parts) {
     const idx = p.indexOf("=");
@@ -89,6 +98,7 @@ function clearCookie(res, name) {
   res.setHeader("Set-Cookie", seg.join("; "));
 }
 
+// ---- signed session cookie ----
 const COOKIE_NAME = "khamin_session";
 
 function signValue(str) {
@@ -138,20 +148,29 @@ function getSession(req) {
   }
 }
 
-// -------------------- guards --------------------
+// ---- guards ----
 function requireOfficer(req, res, next) {
   const s = getSession(req);
-  if (!s || !s.isOfficer)
-    return res.status(401).json({ ok: false, error: "unauthorized" });
+  if (!s || !s.isOfficer) {
+    return res.status(401).json({
+      ok: false,
+      error: "unauthorized",
+      message: "ต้องเข้าสู่ระบบเจ้าหน้าที่ก่อน",
+    });
+  }
   req.user = s;
   next();
 }
 
 function requireSuperAdmin(req, res, next) {
   const s = getSession(req);
-  if (!s || !s.isOfficer)
-    return res.status(401).json({ ok: false, error: "unauthorized" });
-
+  if (!s || !s.isOfficer) {
+    return res.status(401).json({
+      ok: false,
+      error: "unauthorized",
+      message: "ต้องเข้าสู่ระบบเจ้าหน้าที่ก่อน",
+    });
+  }
   if (String(s.username || "") !== SUPER_USERNAME) {
     return res.status(403).json({
       ok: false,
@@ -163,21 +182,48 @@ function requireSuperAdmin(req, res, next) {
   next();
 }
 
-// -------------------- DB schema + seed --------------------
-let __schemaReady = false;
+// ---- env checks ----
+function assertPostgresEnv() {
+  if (!process.env.POSTGRES_URL) {
+    const err = new Error(
+      "POSTGRES_URL หาย (ยังไม่ได้ connect Postgres กับโปรเจกต์ หรือยังไม่ได้ `vercel env pull .env.local` ในเครื่อง)",
+    );
+    err.code = "missing_env_postgres_url";
+    throw err;
+  }
+}
 
-async function ensureSchema() {
-  if (__schemaReady) return;
+function assertBlobEnvIfNeed(hasImages) {
+  // ถ้าไม่ได้ส่งรูป ก็ไม่จำเป็นต้องมี token
+  if (!hasImages) return;
 
+  if (!process.env.BLOB_READ_WRITE_TOKEN) {
+    const err = new Error(
+      "BLOB_READ_WRITE_TOKEN หาย (ต้องตั้งค่าใน Vercel Env เพื่ออัปโหลดรูปไป Blob)",
+    );
+    err.code = "missing_env_blob_token";
+    throw err;
+  }
+}
+
+// ---- DB init: create tables (idempotent) ----
+let DB_READY = false;
+
+async function ensureDbSchema() {
+  if (DB_READY) return;
+
+  assertPostgresEnv();
+
+  // ✅ ตาราง admins
   await sql`
     CREATE TABLE IF NOT EXISTS admins (
       username TEXT PRIMARY KEY,
       password_hash TEXT NOT NULL,
-      name TEXT DEFAULT '',
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
+      name TEXT DEFAULT ''
+    );
   `;
 
+  // ✅ ตาราง petitions
   await sql`
     CREATE TABLE IF NOT EXISTS petitions (
       code TEXT PRIMARY KEY,
@@ -189,9 +235,18 @@ async function ensureSchema() {
       status TEXT NOT NULL DEFAULT 'รับเรื่องแล้ว',
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
+    );
   `;
 
+  // ✅ sequence ต่อปี กัน code ชน
+  await sql`
+    CREATE TABLE IF NOT EXISTS petition_seq (
+      year INT PRIMARY KEY,
+      last INT NOT NULL DEFAULT 0
+    );
+  `;
+
+  // ✅ timeline
   await sql`
     CREATE TABLE IF NOT EXISTS petition_timeline (
       id BIGSERIAL PRIMARY KEY,
@@ -199,30 +254,51 @@ async function ensureSchema() {
       title TEXT NOT NULL,
       time_text TEXT NOT NULL,
       note TEXT DEFAULT ''
-    )
+    );
   `;
 
+  // ✅ images
   await sql`
     CREATE TABLE IF NOT EXISTS petition_images (
       id BIGSERIAL PRIMARY KEY,
       petition_code TEXT NOT NULL REFERENCES petitions(code) ON DELETE CASCADE,
-      kind TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK (kind IN ('before','after')),
       url TEXT NOT NULL
-    )
+    );
+  `;
+
+  // ✅ trigger update updated_at
+  await sql`
+    CREATE OR REPLACE FUNCTION set_updated_at()
+    RETURNS TRIGGER AS $$
+    BEGIN
+      NEW.updated_at = NOW();
+      RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
   `;
 
   await sql`
-    CREATE TABLE IF NOT EXISTS petition_seq (
-      year INT PRIMARY KEY,
-      last INT NOT NULL DEFAULT 0
-    )
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger WHERE tgname = 'trg_petitions_updated_at'
+      ) THEN
+        CREATE TRIGGER trg_petitions_updated_at
+        BEFORE UPDATE ON petitions
+        FOR EACH ROW
+        EXECUTE FUNCTION set_updated_at();
+      END IF;
+    END
+    $$;
   `;
 
-  __schemaReady = true;
+  DB_READY = true;
+  console.log("✅ DB schema ensured");
 }
 
 async function ensureSeedSuperAdmin() {
-  await ensureSchema();
+  await ensureDbSchema();
 
   const row =
     await sql`SELECT username FROM admins WHERE username=${SUPER_USERNAME} LIMIT 1`;
@@ -236,21 +312,20 @@ async function ensureSeedSuperAdmin() {
   console.log("✅ Seeded super admin:", SUPER_USERNAME);
 }
 
-// -------------------- helpers --------------------
+// ---- helpers ----
 function nowTH() {
   return new Date().toLocaleString("th-TH");
 }
 
 async function nextCodeTx() {
-  await ensureSchema();
+  await ensureDbSchema();
 
   const y = new Date().getFullYear();
 
   await sql`BEGIN`;
   try {
     await sql`
-      INSERT INTO petition_seq(year, last)
-      VALUES(${y}, 0)
+      INSERT INTO petition_seq(year, last) VALUES(${y}, 0)
       ON CONFLICT (year) DO NOTHING
     `;
 
@@ -289,12 +364,14 @@ function extFromMime(mime) {
 }
 
 async function uploadImagesToBlob(code, kind, dataUrls) {
-  // ถ้า local ยังไม่มี token ให้ระบบทำงานได้ (แค่ไม่อัปโหลดรูป)
-  if (!process.env.BLOB_READ_WRITE_TOKEN && !IS_VERCEL) return [];
-
   const arr = Array.isArray(dataUrls) ? dataUrls.slice(0, 8) : [];
-  const urls = [];
+  const hasImages = arr.length > 0;
 
+  // ✅ ถ้ามีรูป → ต้องมี token
+  assertBlobEnvIfNeed(hasImages);
+  if (!hasImages) return [];
+
+  const urls = [];
   for (let i = 0; i < arr.length; i++) {
     const p = parseDataUrl(arr[i]);
     if (!p) continue;
@@ -313,16 +390,25 @@ async function uploadImagesToBlob(code, kind, dataUrls) {
   return urls;
 }
 
-// -------------------- pages --------------------
+// ---- pages ----
 app.get("/", (req, res) => res.redirect("/login.html"));
 
 app.get("/api/ping", async (req, res) => {
-  res.json({ ok: true, time: new Date().toISOString(), vercel: IS_VERCEL });
+  res.json({
+    ok: true,
+    time: new Date().toISOString(),
+    vercel: IS_VERCEL,
+    hasPostgres: !!process.env.POSTGRES_URL,
+    hasBlob: !!process.env.BLOB_READ_WRITE_TOKEN,
+  });
 });
 
-// -------------------- auth --------------------
+// ---- auth ----
 app.post("/api/login", async (req, res) => {
   try {
+    // ✅ ชัดเจน: ถ้า POSTGRES_URL หาย จะรู้ทันที
+    assertPostgresEnv();
+
     await ensureSeedSuperAdmin();
 
     const { username, password } = req.body || {};
@@ -332,13 +418,22 @@ app.post("/api/login", async (req, res) => {
     const db =
       await sql`SELECT username, password_hash, name FROM admins WHERE username=${u} LIMIT 1`;
     const found = db.rows?.[0];
+
     if (!found) {
-      return res.status(401).json({ ok: false, error: "invalid_credentials" });
+      return res.status(401).json({
+        ok: false,
+        error: "invalid_credentials",
+        message: "ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง",
+      });
     }
 
     const ok = await bcrypt.compare(p, found.password_hash);
     if (!ok) {
-      return res.status(401).json({ ok: false, error: "invalid_credentials" });
+      return res.status(401).json({
+        ok: false,
+        error: "invalid_credentials",
+        message: "ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง",
+      });
     }
 
     const isSuper = String(found.username) === SUPER_USERNAME;
@@ -363,8 +458,8 @@ app.post("/api/login", async (req, res) => {
     console.error("❌ /api/login error:", e);
     return res.status(500).json({
       ok: false,
-      error: "server_error",
-      message: "server_error",
+      error: e.code || "server_error",
+      message: e.message || "เซิร์ฟเวอร์ผิดพลาด",
     });
   }
 });
@@ -387,10 +482,11 @@ app.get("/api/me", (req, res) => {
   });
 });
 
-// -------------------- citizen submit --------------------
+// ---- citizen submit ----
 app.post("/api/petitions", async (req, res) => {
   try {
-    await ensureSchema();
+    assertPostgresEnv();
+    await ensureDbSchema();
 
     const { village, topic, detail, lat, lng, imagesBefore } = req.body || {};
     const v = String(village ?? "").trim();
@@ -434,16 +530,17 @@ app.post("/api/petitions", async (req, res) => {
     console.error("❌ POST /api/petitions ERROR:", err);
     return res.status(500).json({
       ok: false,
-      error: "server_error",
-      message: "เซิร์ฟเวอร์ผิดพลาด",
+      error: err.code || "server_error",
+      message: err.message || "เซิร์ฟเวอร์ผิดพลาด",
     });
   }
 });
 
-// -------------------- citizen track --------------------
+// ---- citizen track ----
 app.get("/api/track/:code", async (req, res) => {
   try {
-    await ensureSchema();
+    assertPostgresEnv();
+    await ensureDbSchema();
 
     const code = String(req.params.code || "").toUpperCase();
 
@@ -466,8 +563,13 @@ app.get("/api/track/:code", async (req, res) => {
       ORDER BY id ASC
     `;
 
-    const before = imgs.rows.filter((x) => x.kind === "before").map((x) => x.url);
-    const after = imgs.rows.filter((x) => x.kind === "after").map((x) => x.url);
+    const before = (imgs.rows || [])
+      .filter((x) => x.kind === "before")
+      .map((x) => x.url);
+
+    const after = (imgs.rows || [])
+      .filter((x) => x.kind === "after")
+      .map((x) => x.url);
 
     res.json({
       ok: true,
@@ -491,19 +593,26 @@ app.get("/api/track/:code", async (req, res) => {
     });
   } catch (e) {
     console.error("❌ GET /api/track/:code error:", e);
-    res.status(500).json({ ok: false, error: "server_error" });
+    res.status(500).json({
+      ok: false,
+      error: e.code || "server_error",
+      message: e.message || "เซิร์ฟเวอร์ผิดพลาด",
+    });
   }
 });
 
-// -------------------- admin petitions --------------------
+// ---- admin petitions ----
 app.get("/api/admin/petitions", requireOfficer, async (req, res) => {
   try {
-    await ensureSchema();
+    assertPostgresEnv();
+    await ensureDbSchema();
 
     const rows = await sql`SELECT * FROM petitions ORDER BY updated_at DESC`;
+
+    // ให้ admin.js ใช้รูปแบบเดิม
     res.json({
       ok: true,
-      items: rows.rows.map((r) => ({
+      items: (rows.rows || []).map((r) => ({
         code: r.code,
         village: r.village,
         topic: r.topic,
@@ -520,14 +629,19 @@ app.get("/api/admin/petitions", requireOfficer, async (req, res) => {
     });
   } catch (e) {
     console.error("❌ GET /api/admin/petitions error:", e);
-    res.status(500).json({ ok: false, error: "server_error" });
+    res.status(500).json({
+      ok: false,
+      error: e.code || "server_error",
+      message: e.message || "เซิร์ฟเวอร์ผิดพลาด",
+    });
   }
 });
 
-// รายละเอียดเต็ม
+// ✅ รายละเอียดครบ (สำหรับ admin.js selectItem)
 app.get("/api/admin/petitions/:code", requireOfficer, async (req, res) => {
   try {
-    await ensureSchema();
+    assertPostgresEnv();
+    await ensureDbSchema();
 
     const code = String(req.params.code || "").toUpperCase();
 
@@ -550,8 +664,13 @@ app.get("/api/admin/petitions/:code", requireOfficer, async (req, res) => {
       ORDER BY id ASC
     `;
 
-    const before = imgs.rows.filter((x) => x.kind === "before").map((x) => x.url);
-    const after = imgs.rows.filter((x) => x.kind === "after").map((x) => x.url);
+    const before = (imgs.rows || [])
+      .filter((x) => x.kind === "before")
+      .map((x) => x.url);
+
+    const after = (imgs.rows || [])
+      .filter((x) => x.kind === "after")
+      .map((x) => x.url);
 
     res.json({
       ok: true,
@@ -576,104 +695,138 @@ app.get("/api/admin/petitions/:code", requireOfficer, async (req, res) => {
     });
   } catch (e) {
     console.error("❌ GET /api/admin/petitions/:code error:", e);
-    res.status(500).json({ ok: false, error: "server_error" });
+    res.status(500).json({
+      ok: false,
+      error: e.code || "server_error",
+      message: e.message || "เซิร์ฟเวอร์ผิดพลาด",
+    });
   }
 });
 
-app.patch("/api/admin/petitions/:code/status", requireOfficer, async (req, res) => {
-  try {
-    await ensureSchema();
+app.patch(
+  "/api/admin/petitions/:code/status",
+  requireOfficer,
+  async (req, res) => {
+    try {
+      assertPostgresEnv();
+      await ensureDbSchema();
 
-    const code = String(req.params.code || "").toUpperCase();
-    const { status, note } = req.body || {};
+      const code = String(req.params.code || "").toUpperCase();
+      const { status, note } = req.body || {};
 
-    const p =
-      await sql`SELECT code, status FROM petitions WHERE UPPER(code)=${code} LIMIT 1`;
-    const it = p.rows?.[0];
-    if (!it) return res.status(404).json({ ok: false, error: "not_found" });
+      const p =
+        await sql`SELECT code, status FROM petitions WHERE UPPER(code)=${code} LIMIT 1`;
+      const it = p.rows?.[0];
+      if (!it) return res.status(404).json({ ok: false, error: "not_found" });
 
-    const newStatus = String(status || it.status || "รับเรื่องแล้ว");
+      const newStatus = String(status || it.status || "รับเรื่องแล้ว");
 
-    await sql`
-      UPDATE petitions
-      SET status=${newStatus}, updated_at=NOW()
-      WHERE code=${it.code}
-    `;
+      await sql`
+        UPDATE petitions
+        SET status=${newStatus}
+        WHERE code=${it.code}
+      `;
 
-    await sql`
-      INSERT INTO petition_timeline(petition_code, title, time_text, note)
-      VALUES(${it.code}, ${newStatus}, ${nowTH()}, ${String(note || "")})
-    `;
+      await sql`
+        INSERT INTO petition_timeline(petition_code, title, time_text, note)
+        VALUES(${it.code}, ${newStatus}, ${nowTH()}, ${String(note || "")})
+      `;
 
-    res.json({ ok: true });
-  } catch (e) {
-    console.error("❌ PATCH status error:", e);
-    res.status(500).json({ ok: false, error: "server_error" });
-  }
-});
-
-app.patch("/api/admin/petitions/:code/after-images", requireOfficer, async (req, res) => {
-  try {
-    await ensureSchema();
-
-    const code = String(req.params.code || "").toUpperCase();
-    const { imagesAfter } = req.body || {};
-    if (!Array.isArray(imagesAfter)) {
-      return res.status(400).json({
+      res.json({ ok: true });
+    } catch (e) {
+      console.error("❌ PATCH status error:", e);
+      res.status(500).json({
         ok: false,
-        error: "imagesAfter_must_be_array",
-        message: "imagesAfter ต้องเป็น array",
+        error: e.code || "server_error",
+        message: e.message || "เซิร์ฟเวอร์ผิดพลาด",
       });
     }
+  },
+);
 
-    const p =
-      await sql`SELECT code FROM petitions WHERE UPPER(code)=${code} LIMIT 1`;
-    const it = p.rows?.[0];
-    if (!it) return res.status(404).json({ ok: false, error: "not_found" });
+app.patch(
+  "/api/admin/petitions/:code/after-images",
+  requireOfficer,
+  async (req, res) => {
+    try {
+      assertPostgresEnv();
+      await ensureDbSchema();
 
-    const afterUrls = await uploadImagesToBlob(it.code, "after", imagesAfter);
-    for (const url of afterUrls) {
-      await sql`
-        INSERT INTO petition_images(petition_code, kind, url)
-        VALUES(${it.code}, ${"after"}, ${url})
-      `;
+      const code = String(req.params.code || "").toUpperCase();
+      const { imagesAfter } = req.body || {};
+
+      if (!Array.isArray(imagesAfter)) {
+        return res.status(400).json({
+          ok: false,
+          error: "imagesAfter_must_be_array",
+          message: "imagesAfter ต้องเป็น array",
+        });
+      }
+
+      const p =
+        await sql`SELECT code FROM petitions WHERE UPPER(code)=${code} LIMIT 1`;
+      const it = p.rows?.[0];
+      if (!it) return res.status(404).json({ ok: false, error: "not_found" });
+
+      const afterUrls = await uploadImagesToBlob(it.code, "after", imagesAfter);
+
+      for (const url of afterUrls) {
+        await sql`
+          INSERT INTO petition_images(petition_code, kind, url)
+          VALUES(${it.code}, ${"after"}, ${url})
+        `;
+      }
+
+      // updated_at จะถูก trigger อัปเดตตอน UPDATE (กันกรณีไม่แก้ field)
+      await sql`UPDATE petitions SET status=status WHERE code=${it.code}`;
+
+      res.json({ ok: true });
+    } catch (e) {
+      console.error("❌ PATCH after-images error:", e);
+      res.status(500).json({
+        ok: false,
+        error: e.code || "server_error",
+        message: e.message || "เซิร์ฟเวอร์ผิดพลาด",
+      });
     }
-
-    await sql`UPDATE petitions SET updated_at=NOW() WHERE code=${it.code}`;
-
-    res.json({ ok: true });
-  } catch (e) {
-    console.error("❌ PATCH after-images error:", e);
-    res.status(500).json({ ok: false, error: "server_error" });
-  }
-});
+  },
+);
 
 app.delete("/api/admin/petitions/:code", requireOfficer, async (req, res) => {
   try {
-    await ensureSchema();
+    assertPostgresEnv();
+    await ensureDbSchema();
 
     const code = String(req.params.code || "").toUpperCase();
     const del =
       await sql`DELETE FROM petitions WHERE UPPER(code)=${code} RETURNING code`;
+
     if ((del.rows || []).length === 0) {
       return res.status(404).json({ ok: false, error: "not_found" });
     }
     res.json({ ok: true });
   } catch (e) {
     console.error("❌ DELETE petition error:", e);
-    res.status(500).json({ ok: false, error: "server_error" });
+    res.status(500).json({
+      ok: false,
+      error: e.code || "server_error",
+      message: e.message || "เซิร์ฟเวอร์ผิดพลาด",
+    });
   }
 });
 
-// -------------------- admin users (super only) --------------------
+// ---- admin users (super only) ----
 app.get("/api/admin/users", requireSuperAdmin, async (req, res) => {
   try {
-    await ensureSchema();
+    assertPostgresEnv();
+    await ensureDbSchema();
 
-    const rows = await sql`SELECT username, name FROM admins ORDER BY username ASC`;
+    const rows =
+      await sql`SELECT username, name FROM admins ORDER BY username ASC`;
+
     res.json({
       ok: true,
-      users: rows.rows.map((u) => ({
+      users: (rows.rows || []).map((u) => ({
         username: u.username,
         name: u.name || "",
         isSuper: String(u.username) === SUPER_USERNAME,
@@ -681,13 +834,18 @@ app.get("/api/admin/users", requireSuperAdmin, async (req, res) => {
     });
   } catch (e) {
     console.error("❌ GET admin users error:", e);
-    res.status(500).json({ ok: false, error: "server_error" });
+    res.status(500).json({
+      ok: false,
+      error: e.code || "server_error",
+      message: e.message || "เซิร์ฟเวอร์ผิดพลาด",
+    });
   }
 });
 
 app.post("/api/admin/users", requireSuperAdmin, async (req, res) => {
   try {
-    await ensureSchema();
+    assertPostgresEnv();
+    await ensureDbSchema();
 
     const { username, password, name } = req.body || {};
     const u = String(username || "").trim();
@@ -729,18 +887,26 @@ app.post("/api/admin/users", requireSuperAdmin, async (req, res) => {
     }
 
     const hash = await bcrypt.hash(p, 10);
-    await sql`INSERT INTO admins(username, password_hash, name) VALUES(${u}, ${hash}, ${n})`;
+    await sql`
+      INSERT INTO admins(username, password_hash, name)
+      VALUES(${u}, ${hash}, ${n})
+    `;
 
     res.json({ ok: true });
   } catch (e) {
     console.error("❌ POST admin users error:", e);
-    res.status(500).json({ ok: false, error: "server_error" });
+    res.status(500).json({
+      ok: false,
+      error: e.code || "server_error",
+      message: e.message || "เซิร์ฟเวอร์ผิดพลาด",
+    });
   }
 });
 
 app.patch("/api/admin/users/:username", requireSuperAdmin, async (req, res) => {
   try {
-    await ensureSchema();
+    assertPostgresEnv();
+    await ensureDbSchema();
 
     const target = String(req.params.username || "").trim();
     const { password, name } = req.body || {};
@@ -761,15 +927,21 @@ app.patch("/api/admin/users/:username", requireSuperAdmin, async (req, res) => {
     res.json({ ok: true });
   } catch (e) {
     console.error("❌ PATCH admin users error:", e);
-    res.status(500).json({ ok: false, error: "server_error" });
+    res.status(500).json({
+      ok: false,
+      error: e.code || "server_error",
+      message: e.message || "เซิร์ฟเวอร์ผิดพลาด",
+    });
   }
 });
 
 app.delete("/api/admin/users/:username", requireSuperAdmin, async (req, res) => {
   try {
-    await ensureSchema();
+    assertPostgresEnv();
+    await ensureDbSchema();
 
     const target = String(req.params.username || "").trim();
+
     if (target.toLowerCase() === SUPER_USERNAME.toLowerCase()) {
       return res.status(400).json({
         ok: false,
@@ -780,17 +952,22 @@ app.delete("/api/admin/users/:username", requireSuperAdmin, async (req, res) => 
 
     const del =
       await sql`DELETE FROM admins WHERE LOWER(username)=LOWER(${target}) RETURNING username`;
-    if ((del.rows || []).length === 0)
+    if ((del.rows || []).length === 0) {
       return res.status(404).json({ ok: false, error: "not_found" });
+    }
 
     res.json({ ok: true });
   } catch (e) {
     console.error("❌ DELETE admin users error:", e);
-    res.status(500).json({ ok: false, error: "server_error" });
+    res.status(500).json({
+      ok: false,
+      error: e.code || "server_error",
+      message: e.message || "เซิร์ฟเวอร์ผิดพลาด",
+    });
   }
 });
 
-// -------------------- errors --------------------
+// ---- error handlers ----
 app.use((err, req, res, next) => {
   if (err && err.type === "entity.too.large") {
     return res.status(413).json({
@@ -810,16 +987,30 @@ app.use((err, req, res, next) => {
   console.error("❌ Unhandled error middleware:", err);
   return res.status(500).json({
     ok: false,
-    error: "server_error",
-    message: "เซิร์ฟเวอร์ผิดพลาด",
+    error: err.code || "server_error",
+    message: err.message || "เซิร์ฟเวอร์ผิดพลาด",
   });
 });
 
-// local dev
+// local dev only
 if (require.main === module) {
-  app.listen(PORT, () => {
+  app.listen(PORT, async () => {
     console.log(`✅ Server running: http://localhost:${PORT}`);
     console.log(`📁 Serving web from: ${WEB_DIR}`);
+
+    // ✅ ลองเช็ค schema ตอน start (ถ้า env มี)
+    try {
+      if (process.env.POSTGRES_URL) {
+        await ensureDbSchema();
+        await ensureSeedSuperAdmin();
+      } else {
+        console.warn(
+          "⚠️ POSTGRES_URL ยังไม่มี: ถ้ารันในเครื่องให้ทำ `vercel env pull .env.local`",
+        );
+      }
+    } catch (e) {
+      console.error("❌ DB init error:", e);
+    }
   });
 }
 
